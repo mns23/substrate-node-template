@@ -3,12 +3,72 @@
 /// Edit this file to define custom logic or remove it if it is not needed.
 /// Learn more about FRAME and the core library of Substrate FRAME pallets:
 /// <https://docs.substrate.io/reference/frame-pallets/>
+use frame_support::pallet_prelude::*;
+
 pub use pallet::*;
+
+#[derive(
+	Encode, Decode, Default, Clone, RuntimeDebug, MaxEncodedLen, TypeInfo, PartialEq,
+)]
+pub enum MatchStatus {
+	#[default]
+	Open,
+	Closed,
+	Postponed,
+}
+
+#[derive(
+	Encode, Decode, Default, RuntimeDebug, MaxEncodedLen, TypeInfo, PartialEq,
+)]
+pub struct SingleMatch {
+	pub id_match: u32,
+	pub status: MatchStatus,
+	//pub description: String,
+	pub home_score: u32,
+	pub away_score: u32,
+}
+// use codec::{Decode, Encode};
+// use frame_support::{
+// 	dispatch::{DispatchResult, Dispatchable, GetDispatchInfo},
+// 	ensure,
+// 	pallet_prelude::MaxEncodedLen,
+// 	storage::bounded_vec::BoundedVec,
+// 	traits::{Currency, ExistenceRequirement::KeepAlive, Get, Randomness, ReservableCurrency},
+// 	PalletId, RuntimeDebug,
+// };
+// use sp_runtime::{
+// 	traits::{AccountIdConversion, Saturating, Zero},
+// 	ArithmeticError, DispatchError,
+// };
+// use sp_std::prelude::*;
+// pub use weights::WeightInfo;
+
+
+// pub enum Prediction {
+// 	Homewin,
+// 	Awaywin,
+// 	Draw,
+// 	Under,
+// 	Over,
+// }
+
+// #[derive(
+// 	Encode, Decode, Default, RuntimeDebug
+// )]
+// pub struct Bet<Balance> {
+// 	pub id_match: u32,
+// 	pub prediction: u32,
+// 	pub odd: u32,
+// 	pub amount: Balance,
+// }
+
 
 #[frame_support::pallet]
 pub mod pallet {
-	use frame_support::pallet_prelude::*;
+	use super::*;
+	//use frame_support::pallet_prelude::*;
 	use frame_system::pallet_prelude::*;
+
 
 	#[pallet::pallet]
 	#[pallet::generate_store(pub(super) trait Store)]
@@ -23,10 +83,11 @@ pub mod pallet {
 
 	// The pallet's runtime storage items.
 	// https://docs.substrate.io/main-docs/build/runtime-storage/
-	// #[pallet::storage]
-	// #[pallet::getter(fn something)]
 	#[pallet::storage]
-	pub(super) type Claims<T: Config> = StorageMap<_, Blake2_128Concat, T::Hash, (T::AccountId, T::BlockNumber)>;
+	//pub(super) type Matches<T: Config> = StorageMap<_, Blake2_128Concat, T::Hash, (T::AccountId, T::BlockNumber)>;
+	#[pallet::getter(fn matches_by_id)]
+	pub(super) type Matches <T> =
+		StorageMap<_, Blake2_128Concat, u32, SingleMatch, ValueQuery>;
 	// Learn more about declaring storage items:
 	// https://docs.substrate.io/main-docs/build/runtime-storage/#declaring-storage-items
 	// pub type Something<T> = StorageValue<_, u32>;
@@ -59,44 +120,56 @@ pub mod pallet {
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
 		#[pallet::weight(0)]
-		pub fn create_claim(origin: OriginFor<T>, claim: T::Hash) -> DispatchResult {
+		pub fn create_match(
+			origin: OriginFor<T>,
+			id_match: u32,
+			status: MatchStatus,
+			home_score: u32,
+			away_score: u32,
+			hash: T::Hash
+		) -> DispatchResult {
 			// Check that the extrinsic was signed and get the signer.
 			// This function will return an error if the extrinsic is not signed.
 			let sender = ensure_signed(origin)?;
 
 			// Verify that the specified claim has not already been stored.
-			ensure!(!Claims::<T>::contains_key(&claim), Error::<T>::AlreadyClaimed);
+			//ensure!(!Claims::<T>::contains_key(&claim), Error::<T>::AlreadyClaimed);
 
 			// Get the block number from the FRAME System pallet.
-			let current_block = <frame_system::Pallet<T>>::block_number();
-
+			//let current_block = <frame_system::Pallet<T>>::block_number();
+			let single_match = SingleMatch {
+				id_match,
+				status,
+				home_score,
+				away_score,
+			};
 			// Store the claim with the sender and block number.
-			Claims::<T>::insert(&claim, (&sender, current_block));
+			<Matches<T>>::insert(id_match, single_match);
 
 			// Emit an event that the claim was created.
-			Self::deposit_event(Event::ClaimCreated { who: sender, claim });
+			Self::deposit_event(Event::ClaimCreated { who: sender, claim: hash});
 
 			Ok(())
 		}
 
-		#[pallet::weight(0)]
-		pub fn revoke_claim(origin: OriginFor<T>, claim: T::Hash) -> DispatchResult {
-			// Check that the extrinsic was signed and get the signer.
-			// This function will return an error if the extrinsic is not signed.
-			let sender = ensure_signed(origin)?;
+		// #[pallet::weight(0)]
+		// pub fn revoke_claim(origin: OriginFor<T>, claim: T::Hash) -> DispatchResult {
+		// 	// Check that the extrinsic was signed and get the signer.
+		// 	// This function will return an error if the extrinsic is not signed.
+		// 	let sender = ensure_signed(origin)?;
 
-			// Get owner of the claim, if none return an error.
-			let (owner, _) = Claims::<T>::get(&claim).ok_or(Error::<T>::NoSuchClaim)?;
+		// 	// Get owner of the claim, if none return an error.
+		// 	let (owner, _) = Claims::<T>::get(&claim).ok_or(Error::<T>::NoSuchClaim)?;
 
-			// Verify that sender of the current call is the claim owner.
-			ensure!(sender == owner, Error::<T>::NotClaimOwner);
+		// 	// Verify that sender of the current call is the claim owner.
+		// 	ensure!(sender == owner, Error::<T>::NotClaimOwner);
 
-			// Remove claim from storage.
-			Claims::<T>::remove(&claim);
+		// 	// Remove claim from storage.
+		// 	Claims::<T>::remove(&claim);
 
-			// Emit an event that the claim was erased.
-			Self::deposit_event(Event::ClaimRevoked { who: sender, claim });
-			Ok(())
-		}
+		// 	// Emit an event that the claim was erased.
+		// 	Self::deposit_event(Event::ClaimRevoked { who: sender, claim });
+		// 	Ok(())
+		// }
 	}
 }
