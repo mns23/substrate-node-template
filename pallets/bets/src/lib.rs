@@ -44,8 +44,10 @@ use frame_support::sp_runtime::{
 use sp_std::prelude::*;
 //pub use weights::WeightInfo;
 
-
-pub type BetIndex = u32;
+/// An index of a Match
+pub type MatchIndex = u64;
+/// An index of a Bet
+pub type BetIndex = u64;
 type AccountIdOf<T> = <T as frame_system::Config>::AccountId;
 type BalanceOf<T> = <<T as Config>::Currency as Currency<AccountIdOf<T>>>::Balance;
 type BetInfoOf<T> = Bet<AccountIdOf<T>, BalanceOf<T>>;
@@ -68,8 +70,11 @@ pub enum MatchStatus {
 	Encode, Decode, Default, RuntimeDebug, MaxEncodedLen, TypeInfo, PartialEq, Clone, Copy,
 )]
 pub struct SingleMatch<AccountId> {
+	/// The owner of a Match, account who accept bets with conditions below.
 	pub owner: AccountId,
-	pub id_match: u32,
+	/// The id of external event. Will be used by ocw to retrieve match result.
+	pub id_event: u32,
+	/// The status of the match : open, closed or postponed.
 	pub status: MatchStatus,
 	pub home_score: u32,
 	pub away_score: u32,
@@ -97,6 +102,7 @@ pub enum Prediction {
 )]
 pub enum BetStatus {
 	#[default]
+	Open,
 	Lost,
 	Won,
 }
@@ -105,11 +111,18 @@ pub enum BetStatus {
 	Encode, Decode, Default, RuntimeDebug, MaxEncodedLen, TypeInfo, PartialEq,
 )]
 pub struct Bet<AccountId, Balance> {
+	/// The owner of the bet, bettor account.
 	pub owner: AccountId,
-	pub id_match: u32,
+	/// Reference to the match on which bet on.
+	pub id_match: MatchIndex,
+	/// Result prediction.
 	pub prediction: Prediction,
+	/// Save Odd value at the moment of Bet (Odds could changhe).
 	pub odd: Odd,
+	/// The amount wagered.
 	pub amount: Balance,
+	/// The status of the bet
+	pub status: BetStatus,
 }
 
 #[frame_support::pallet]
@@ -135,20 +148,30 @@ pub mod pallet {
 	}
 
 	#[pallet::storage]
-	/// Mapping matches using its id as key.
+	/// Mapping matches using match_index as key.
 	#[pallet::getter(fn matches_by_id)]
 	pub(super) type Matches <T> =
-		StorageMap<_, Blake2_128Concat, u32, SingleMatch<AccountIdOf<T>>, OptionQuery>;
-	
+		StorageMap<_, Blake2_128Concat, MatchIndex, SingleMatch<AccountIdOf<T>>, OptionQuery>;
+
+	/// Mapping bets using bet_index as key.
 	#[pallet::storage]
+	#[pallet::getter(fn bets_by_id)]
+	pub(super) type Bets<T: Config> =
+		StorageMap<_, Blake2_128Concat, BetIndex, BetInfoOf<T>, OptionQuery>;
+
 	/// A Storage Double Map of bets. Referenced by the id match to which it refers
 	/// (to quickly find all the bets related to a specific match), and its index.
-	#[pallet::getter(fn bets)]
-	pub(super) type Bets<T: Config> =
-		StorageDoubleMap<_, Blake2_128Concat, u32, Blake2_128Concat, BetIndex, BetInfoOf<T>, OptionQuery>;
+	// #[pallet::storage]
+	// #[pallet::getter(fn bets)]
+	// pub(super) type Bets<T: Config> =
+	// 	StorageDoubleMap<_, Blake2_128Concat, u32, Blake2_128Concat, BetIndex, BetInfoOf<T>, OptionQuery>;
 
+	/// Auto-incrementing match counter
 	#[pallet::storage]
+	#[pallet::getter(fn matches_count)]
+	pub(super) type MatchCount<T: Config> = StorageValue<_, MatchIndex, ValueQuery>;
 	/// Auto-incrementing bet counter
+	#[pallet::storage]
 	#[pallet::getter(fn bets_count)]
 	pub(super) type BetCount<T: Config> = StorageValue<_, BetIndex, ValueQuery>;
 
@@ -156,17 +179,17 @@ pub mod pallet {
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
 		/// A match was created.
-		MatchCreated(u32),
+		MatchCreated(MatchIndex),
 		/// A bet was placed.
 		BetPlaced(BetIndex),
 		/// A match was closed.
-		MatchClosed(u32),
+		MatchClosed(MatchIndex),
+		/// A match was closed.
+		BetClaimed(BetIndex),
 	}
 
 	#[pallet::error]
 	pub enum Error<T> {
-		/// Cannot create a match with an already existing id_match.
-		IdMatchAlreadyExists,
 		/// A specific match does not exist, cannot place a bet or set match result.
 		MatchNotExists,
 		/// Bet owner and match owner must be different.
@@ -177,12 +200,16 @@ pub mod pallet {
 		OddIntPartOutOfBound,
 		/// Match not open for bets or updates, functions available only on open matches.
 		MatchClosed,
+		/// Match open during a bet claim.
+		MatchOpen,
 		/// Insufficient free-balance to offer a bet.
 		MatchAccountInsufficientBalance,
 		/// Insufficient free-balance to place a bet.
 		BetAccountInsufficientBalance,
-		/// No bet associated with a specific match exists.
-		NoBetExists,
+		/// A specific bet does not exists.
+		BetNotExists,
+		/// Match not open for bets or updates, functions available only on open matches.
+		BetClosed,
 		/// Payoff procedure failed.
 		PayoffError,
 	}
@@ -194,7 +221,7 @@ pub mod pallet {
 		#[pallet::weight(10_000)]
 		pub fn create_match(
 			origin: OriginFor<T>,
-			id_match: u32,
+			id_event: u32,
 			odd_homewin: Odd,
 			odd_awaywin: Odd,
 			odd_draw: Odd,
@@ -208,12 +235,10 @@ pub mod pallet {
 			ensure!(odd_homewin.1 < 99 && odd_awaywin.1 < 99 && odd_draw.1 < 99 && odd_under.1 < 99 && odd_over.1 < 99, Error::<T>::OddFracPartOutOfBound);
 			// Check integer part of Odd >= 1.
 			ensure!(odd_homewin.0 > 0 && odd_awaywin.0 > 0 && odd_draw.0 > 0 && odd_under.0 > 0 && odd_over.0 > 0, Error::<T>::OddIntPartOutOfBound);
-			// Verify that the specified claim has not already been stored.
-			ensure!(!<Matches<T>>::contains_key(id_match), Error::<T>::IdMatchAlreadyExists);
 
 			let single_match = SingleMatch {
 				owner,
-				id_match,
+				id_event,
 				status: MatchStatus::Open,
 				home_score: 0, 
 				away_score: 0,
@@ -223,10 +248,14 @@ pub mod pallet {
 				odd_under,
 				odd_over,
 			};
-			// Store the match with id_match as key.
-			<Matches<T>>::insert(id_match, single_match);
 
-			Self::deposit_event(Event::MatchCreated(id_match));
+			let match_index = Self::matches_count();
+			// Store the match with id_match as key.
+			<Matches<T>>::insert(match_index, single_match);
+			// Not protected against overflow.
+			MatchCount::<T>::put(match_index + 1);
+
+			Self::deposit_event(Event::MatchCreated(match_index));
 			Ok(())
 		}
 
@@ -237,7 +266,7 @@ pub mod pallet {
 		#[pallet::weight(10_000)]
 		pub fn place_bet(
 			origin: OriginFor<T>,
-			id_match: u32,
+			id_match: MatchIndex,
 			prediction: Prediction,
 			amount: BalanceOf<T>,
 		) -> DispatchResult {
@@ -263,10 +292,8 @@ pub mod pallet {
 			};
 
 			let winnable_amount = (Percent::from_percent(odd.1) * amount).saturating_add(amount.saturating_mul((odd.0 as u32).into()));
-			// todo: add mod arithmetic for fixed point odd.
 			ensure!(T::Currency::can_reserve(&match_owner, winnable_amount), Error::<T>::MatchAccountInsufficientBalance);
 			T::Currency::reserve(&bet_owner, amount)?;
-			// todo: add mod arithmetic for fixed point odd.
 			T::Currency::reserve(&match_owner, winnable_amount)?;
 
 			let bet = Bet {
@@ -275,78 +302,143 @@ pub mod pallet {
 				prediction,
 				odd,
 				amount,
+				status: BetStatus::Open,
 			};
-			// not protected against overflow, see safemath section.
+			
+			// Insert bet into its storage double map.
+			<Bets<T>>::insert(bet_index, bet);
+			// Not protected against overflow.
 			BetCount::<T>::put(bet_index + 1);
-			// insert bet into its storage double map.
-			<Bets<T>>::insert(id_match, bet_index,bet);
 
 			Self::deposit_event(Event::BetPlaced(bet_index));
 			Ok(().into())
 		}
 
-		/// Retrieves the match result and saves it in storage. Subsequently, based on the latter,
-		/// it scrolls all the bets related to that match and establishes the outcome, unreserving the entire amount of the bet
-		/// to the winner (bettor or bookmaker). N.B.:
-		///     * This call that can be made by any user at the moment, should be scheduled after the end of the event,
-		/// 	saving the end-of-event timestamp among the match data.
-		///     * The retrieval of a match result should be done through HTTP request using an ocw. To simplify this function,
-		/// 	the RandomnessCollectiveFlip implementation of Randomness was used to generate the scores of the teams.
+		/// Saves the match result into storage. At the moment the results are generated randomly,
+		/// in future developments it can be called by the oracle.
 		#[pallet::weight(10_000)]
 		pub fn set_match_result(
 			origin: OriginFor<T>,
-			id_match: u32,
+			id_match: MatchIndex,
 		) -> DispatchResult {
 			let _who = ensure_signed(origin)?;
 			let mut selected_match = Self::matches_by_id(id_match).ok_or(Error::<T>::MatchNotExists)?;
 			// Check if match is open.
 			ensure!(selected_match.status == MatchStatus::Open, Error::<T>::MatchClosed);
-			let match_owner = selected_match.owner.clone();
-			let selected_bets = <Bets<T>>::iter_prefix_values(id_match);
 			// Update match status and results.
 			// todo: randomize also MatchStatus.
 			selected_match.status = MatchStatus::Closed;
 			selected_match.home_score = Self::generate_random_score(0);
 			selected_match.away_score = Self::generate_random_score(1);
-			<Matches<T>>::insert(id_match, selected_match.clone());
+			<Matches<T>>::insert(id_match, selected_match);
 			// todo: maybe can try also this way: <Matches<T>>::try_mutate, instead of insert.
 			
-			// Check the winning status of the bet compared to match results.
-			let mut payoff_result = true;
-			selected_bets.for_each(|bet|{
-				let bet_status: BetStatus = match &bet.prediction {
-					Prediction::Homewin if selected_match.home_score > selected_match.away_score => BetStatus::Won,
-					Prediction::Awaywin if selected_match.home_score < selected_match.away_score => BetStatus::Won,
-					Prediction::Draw if selected_match.home_score == selected_match.away_score => BetStatus::Won,
-					Prediction::Over if selected_match.home_score + selected_match.away_score > 3 => BetStatus::Won,
-					Prediction::Under if selected_match.home_score + selected_match.away_score < 3 => BetStatus::Won,
-					_ => BetStatus::Lost,
-				};
-				let winnable_amount = (Percent::from_percent(bet.odd.1) * bet.amount).saturating_add(bet.amount.saturating_mul((bet.odd.0 as u32).into()));
-				// Pay off the bet.
-				if bet_status == BetStatus::Won {
-					let repatriate_result_mtob = T::Currency::repatriate_reserved(&match_owner, &(bet.owner), winnable_amount, BalanceStatus::Free).is_ok();
-					let repatriate_result_btom = T::Currency::repatriate_reserved(&(bet.owner), &match_owner, bet.amount, BalanceStatus::Free).is_ok();
-					if repatriate_result_mtob == false || repatriate_result_btom == false {
-						payoff_result = false;
-					}
-				} else {
-					let repatriate_result = T::Currency::repatriate_reserved(&(bet.owner), &match_owner, bet.amount.clone(), BalanceStatus::Free).is_ok();
-					let unreserve_result = T::Currency::unreserve(&match_owner, winnable_amount);
-					if repatriate_result == false || !unreserve_result.is_zero() {
-						payoff_result = false;
-					}
-				}
-				
-				// change bet status and save.
-				//bet.status = new_bet_status;
-				//let key : u8 = selected_bets.last_raw_key();
-				//<Bets<T>>::insert(id_match, selected_bets.last_raw_key(),bet);
-			});
-			ensure!(payoff_result == true, Error::<T>::PayoffError);
 			Self::deposit_event(Event::MatchClosed(id_match));
 			Ok(().into())
 		}
+
+		/// Settles a bet, unlocking all funds towards the winner.
+		#[pallet::weight(10_000)]
+		pub fn claim_bet(
+			origin: OriginFor<T>,
+			id_bet: BetIndex,
+		) -> DispatchResult {
+			let _who = ensure_signed(origin)?;
+			let mut selected_bet = Self::bets_by_id(id_bet).ok_or(Error::<T>::BetNotExists)?;
+			// Check if bet is open.
+			ensure!(selected_bet.status == BetStatus::Open, Error::<T>::BetClosed);
+			let mut selected_match = Self::matches_by_id(selected_bet.id_match).ok_or(Error::<T>::MatchNotExists)?;
+			// Check if match is open.
+			ensure!(selected_match.status == MatchStatus::Closed || selected_match.status == MatchStatus::Postponed, Error::<T>::MatchOpen);
+			let bet_status: BetStatus = match selected_bet.prediction {
+				Prediction::Homewin if selected_match.home_score > selected_match.away_score => BetStatus::Won,
+				Prediction::Awaywin if selected_match.home_score < selected_match.away_score => BetStatus::Won,
+				Prediction::Draw if selected_match.home_score == selected_match.away_score => BetStatus::Won,
+				Prediction::Over if selected_match.home_score + selected_match.away_score > 3 => BetStatus::Won,
+				Prediction::Under if selected_match.home_score + selected_match.away_score < 3 => BetStatus::Won,
+				_ => BetStatus::Lost,
+			};
+			let winnable_amount = (Percent::from_percent(selected_bet.odd.1) * selected_bet.amount).saturating_add(selected_bet.amount.saturating_mul((selected_bet.odd.0 as u32).into()));
+			// Pay off the bet.
+			let match_owner = selected_match.owner.clone();
+			if bet_status == BetStatus::Won {
+				T::Currency::repatriate_reserved(&match_owner, &(selected_bet.owner), winnable_amount, BalanceStatus::Free)?;
+				T::Currency::repatriate_reserved(&(selected_bet.owner), &match_owner, selected_bet.amount, BalanceStatus::Free)?;
+			} else {
+				T::Currency::repatriate_reserved(&(selected_bet.owner), &match_owner, selected_bet.amount.clone(), BalanceStatus::Free)?;
+				T::Currency::unreserve(&match_owner, winnable_amount);
+			}
+			
+			// Change bet status and save.
+			selected_bet.status = bet_status;
+			<Bets<T>>::insert(id_bet, selected_bet);
+			
+			Self::deposit_event(Event::BetClaimed(id_bet));
+			Ok(().into())
+		}
+
+		// /// Retrieves the match result and saves it in storage. Subsequently, based on the latter,
+		// /// it scrolls all the bets related to that match and establishes the outcome, unreserving the entire amount of the bet
+		// /// to the winner (bettor or bookmaker). N.B.:
+		// ///     * This call that can be made by any user at the moment, should be scheduled after the end of the event,
+		// /// 	saving the end-of-event timestamp among the match data.
+		// ///     * The retrieval of a match result should be done through HTTP request using an ocw. To simplify this function,
+		// /// 	the RandomnessCollectiveFlip implementation of Randomness was used to generate the scores of the teams.
+		// #[pallet::weight(10_000)]
+		// pub fn set_match_result_old(
+		// 	origin: OriginFor<T>,
+		// 	id_match: u32,
+		// ) -> DispatchResult {
+		// 	let _who = ensure_signed(origin)?;
+		// 	let mut selected_match = Self::matches_by_id(id_match).ok_or(Error::<T>::MatchNotExists)?;
+		// 	// Check if match is open.
+		// 	ensure!(selected_match.status == MatchStatus::Open, Error::<T>::MatchClosed);
+		// 	let match_owner = selected_match.owner.clone();
+		// 	let selected_bets = <Bets<T>>::iter_prefix_values(id_match);
+		// 	// Update match status and results.
+		// 	// todo: randomize also MatchStatus.
+		// 	selected_match.status = MatchStatus::Closed;
+		// 	selected_match.home_score = Self::generate_random_score(0);
+		// 	selected_match.away_score = Self::generate_random_score(1);
+		// 	<Matches<T>>::insert(id_match, selected_match.clone());
+		// 	// todo: maybe can try also this way: <Matches<T>>::try_mutate, instead of insert.
+			
+		// 	// Check the winning status of the bet compared to match results.
+		// 	let mut payoff_result = true;
+		// 	selected_bets.for_each(|bet|{
+		// 		let bet_status: BetStatus = match &bet.prediction {
+		// 			Prediction::Homewin if selected_match.home_score > selected_match.away_score => BetStatus::Won,
+		// 			Prediction::Awaywin if selected_match.home_score < selected_match.away_score => BetStatus::Won,
+		// 			Prediction::Draw if selected_match.home_score == selected_match.away_score => BetStatus::Won,
+		// 			Prediction::Over if selected_match.home_score + selected_match.away_score > 3 => BetStatus::Won,
+		// 			Prediction::Under if selected_match.home_score + selected_match.away_score < 3 => BetStatus::Won,
+		// 			_ => BetStatus::Lost,
+		// 		};
+		// 		let winnable_amount = (Percent::from_percent(bet.odd.1) * bet.amount).saturating_add(bet.amount.saturating_mul((bet.odd.0 as u32).into()));
+		// 		// Pay off the bet.
+		// 		if bet_status == BetStatus::Won {
+		// 			let repatriate_result_mtob = T::Currency::repatriate_reserved(&match_owner, &(bet.owner), winnable_amount, BalanceStatus::Free).is_ok();
+		// 			let repatriate_result_btom = T::Currency::repatriate_reserved(&(bet.owner), &match_owner, bet.amount, BalanceStatus::Free).is_ok();
+		// 			if repatriate_result_mtob == false || repatriate_result_btom == false {
+		// 				payoff_result = false;
+		// 			}
+		// 		} else {
+		// 			let repatriate_result = T::Currency::repatriate_reserved(&(bet.owner), &match_owner, bet.amount.clone(), BalanceStatus::Free).is_ok();
+		// 			let unreserve_result = T::Currency::unreserve(&match_owner, winnable_amount);
+		// 			if repatriate_result == false || !unreserve_result.is_zero() {
+		// 				payoff_result = false;
+		// 			}
+		// 		}
+				
+		// 		// change bet status and save.
+		// 		//bet.status = new_bet_status;
+		// 		//let key : u8 = selected_bets.last_raw_key();
+		// 		//<Bets<T>>::insert(id_match, selected_bets.last_raw_key(),bet);
+		// 	});
+		// 	ensure!(payoff_result == true, Error::<T>::PayoffError);
+		// 	Self::deposit_event(Event::MatchClosed(id_match));
+		// 	Ok(().into())
+		// }
 
 	}
 }
