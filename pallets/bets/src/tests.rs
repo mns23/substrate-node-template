@@ -24,23 +24,30 @@ fn initial_state() {
 #[test]
 fn end_to_end_three_bets_works() {
 	new_test_ext().execute_with(|| {
-		let id_match = 0;
+		let id_match: MatchId = (1,23);
+		let odds = Odds {
+			homewin: (2,00),
+			awaywin: (2,00),
+			draw: (2,00),
+			under: (2,00),
+			over: (2,00),
+		};
 		assert_eq!(Balances::total_issuance(), 500);
-		assert_ok!(Bets::create_match(Origin::signed(1), 1292, (2,00), (2,00), (2,00), (2,00), (2,00)));
+		assert_ok!(Bets::create_odds(Origin::signed(1), id_match, odds));
 		assert_eq!(Matches::<Test>::contains_key(id_match), true);
-		assert_ok!(Bets::place_bet(Origin::signed(2), id_match, Prediction::Homewin, 20));
+		assert_ok!(Bets::place_bet(Origin::signed(2), id_match, 1, Prediction::Homewin, 20));
 		assert_eq!(Bets::bets_count(), 1);
-		assert_ok!(Bets::place_bet(Origin::signed(3), id_match, Prediction::Draw, 20));
+		assert_ok!(Bets::place_bet(Origin::signed(3), id_match, 1, Prediction::Draw, 20));
 		assert_eq!(Bets::bets_count(), 2);
-		assert_noop!(Bets::place_bet(Origin::signed(4), id_match, Prediction::Draw, 30), Error::<Test>::MatchAccountInsufficientBalance);
+		assert_noop!(Bets::place_bet(Origin::signed(4), id_match, 1, Prediction::Draw, 30), Error::<Test>::OddsAccountInsufficientBalance);
 		assert_eq!(Bets::bets_count(), 2);
-		assert_ok!(Bets::place_bet(Origin::signed(4), id_match, Prediction::Awaywin, 10));
+		assert_ok!(Bets::place_bet(Origin::signed(4), id_match, 1, Prediction::Awaywin, 10));
 		assert_eq!(Bets::bets_count(), 3);
 		assert_eq!(Balances::free_balance(1), 0);
 		assert_ok!(Bets::set_match_result(Origin::signed(5), id_match));
-		assert_ok!(Bets::claim_bet(Origin::signed(5), 0));
-		assert_ok!(Bets::claim_bet(Origin::signed(5), 1));
-		assert_ok!(Bets::claim_bet(Origin::signed(5), 2));
+		assert_ok!(Bets::settle_bet(Origin::signed(5), 0));
+		assert_ok!(Bets::settle_bet(Origin::signed(5), 1));
+		assert_ok!(Bets::settle_bet(Origin::signed(5), 2));
 		assert_eq!(Balances::free_balance(1) > 100, true);
 		assert_eq!(Balances::free_balance(2)+Balances::free_balance(3)+Balances::free_balance(4) < 300, true);
 	});
