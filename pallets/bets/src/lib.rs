@@ -134,7 +134,7 @@ pub struct Bet<AccountId, Balance, OddsId> {
 
 #[frame_support::pallet]
 pub mod pallet {
-use super::*;
+	use super::*;
 	use frame_system::pallet_prelude::*;
 
 	#[pallet::pallet]
