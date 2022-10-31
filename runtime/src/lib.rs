@@ -352,6 +352,7 @@ impl pallet_bets::Config for Runtime {
 	type Currency = Balances;
 	type Event = Event;
 	type Randomness = RandomnessCollectiveFlip;
+	type AuthorityId = pallet_bets::crypto::TestAuthId;
 }
 
 // For pallet-example-offchain-worker

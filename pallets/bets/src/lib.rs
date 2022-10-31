@@ -36,9 +36,24 @@ use frame_support::{
 	traits::{Currency, Get, ReservableCurrency, BalanceStatus, Randomness},
 	PalletId, RuntimeDebug,
 };
+use frame_system::{
+	offchain::{
+		AppCrypto, CreateSignedTransaction, SendSignedTransaction, SendUnsignedTransaction,
+		SignedPayload, Signer, SigningTypes, SubmitTransaction,
+	},
+	self as system,
+};
 pub use pallet::*;
+use lite_json::json::JsonValue;
+use sp_core::crypto::KeyTypeId;
 use frame_support::sp_runtime::{
-	traits::{Saturating},
+	offchain::{
+		http,
+		storage::{MutateStorageError, StorageRetrievalError, StorageValueRef},
+		Duration,
+	},
+	traits::{Saturating, Zero},
+	transaction_validity::{InvalidTransaction, TransactionValidity, ValidTransaction},
 	Percent,
 };
 use sp_std::prelude::*;
@@ -66,6 +81,7 @@ type Odd = (u32, u8);
 /// A Match have an initial state (Open), and 2 final states (Closed, Postponed).
 pub enum MatchStatus {
 	#[default]
+	Locked,
 	Open,
 	Closed,
 	Postponed,
@@ -79,6 +95,7 @@ pub struct Match {
 	pub status: MatchStatus,
 	pub home_score: u32,
 	pub away_score: u32,
+	pub timestamp_start: u32,
 }
 
 #[derive(
@@ -132,6 +149,36 @@ pub struct Bet<AccountId, Balance, OddsId> {
 	pub status: BetStatus,
 }
 
+// Offchain worker
+pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"btc!");
+pub mod crypto {
+	use super::KEY_TYPE;
+	use sp_core::sr25519::Signature as Sr25519Signature;
+	use frame_support::sp_runtime::{
+		app_crypto::{app_crypto, sr25519},
+		traits::Verify,
+		MultiSignature, MultiSigner,
+	};
+	app_crypto!(sr25519, KEY_TYPE);
+
+	pub struct TestAuthId;
+
+	impl frame_system::offchain::AppCrypto<MultiSigner, MultiSignature> for TestAuthId {
+		type RuntimeAppPublic = Public;
+		type GenericSignature = sp_core::sr25519::Signature;
+		type GenericPublic = sp_core::sr25519::Public;
+	}
+
+	// implemented for mock runtime in test
+	impl frame_system::offchain::AppCrypto<<Sr25519Signature as Verify>::Signer, Sr25519Signature>
+		for TestAuthId
+	{
+		type RuntimeAppPublic = Public;
+		type GenericSignature = sp_core::sr25519::Signature;
+		type GenericPublic = sp_core::sr25519::Public;
+	}
+}
+
 #[frame_support::pallet]
 pub mod pallet {
 	use super::*;
@@ -142,7 +189,7 @@ pub mod pallet {
 	pub struct Pallet<T>(_);
 
 	#[pallet::config]
-	pub trait Config: frame_system::Config {
+	pub trait Config: frame_system::Config + CreateSignedTransaction<Call<Self>> {
 		/// The bets pallet id.
 		#[pallet::constant]
 		type PalletId: Get<PalletId>;
@@ -152,6 +199,8 @@ pub mod pallet {
 		type Currency: ReservableCurrency<Self::AccountId>;
 		/// Something that provides randomness in the runtime.
 		type Randomness: Randomness<Self::Hash, Self::BlockNumber>;
+		/// The identifier type for an offchain worker.
+		type AuthorityId: AppCrypto<Self::Public, Self::Signature>;
 	}
 
 	/// Mapping matches using match_index as key.
@@ -189,6 +238,8 @@ pub mod pallet {
 	pub enum Event<T: Config> {
 		/// A Match was created.
 		MatchCreated(MatchId),
+		/// A Match was opened.
+		MatchOpened(MatchId),
 		/// Some Odds was created.
 		OddsCreated(OddsId<T>),
 		/// A Bet was placed.
@@ -203,6 +254,8 @@ pub mod pallet {
 	pub enum Error<T> {
 		/// A specific match does not exist, cannot place a bet or set match result.
 		MatchNotExists,
+		/// A specific match is not locked, cannot open it to odds.
+		MatchNotLocked,
 		/// A specific odds does not exist, cannot place a bet.
 		OddsNotExist,
 		/// Bet owner and match owner must be different.
@@ -227,6 +280,39 @@ pub mod pallet {
 		PayoffError,
 	}
 
+	#[pallet::hooks]
+	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+		/// Offchain Worker entry point.
+		fn offchain_worker(block_number: T::BlockNumber) {
+			
+			log::info!("Hello World from offchain workers!");
+			let parent_hash = <system::Pallet<T>>::block_hash(block_number - 1u32.into());
+			log::debug!("Current block: {:?} (parent hash: {:?})", block_number, parent_hash);
+			for matches in <Matches<T>>::iter() {
+				log::info!("Current match status: {:?}", matches.1.status);
+				if matches.1.status == MatchStatus::Locked {
+					log::info!("Match {:?} Locked", matches.0);
+					Self::fetch_timestamp_and_send_signed(matches.0);
+				}
+			}
+
+			// let should_send = Self::choose_transaction_type(block_number);
+			// let res = match should_send {
+			// 	TransactionType::Signed => Self::fetch_price_and_send_signed(),
+			// 	TransactionType::UnsignedForAny =>
+			// 		Self::fetch_price_and_send_unsigned_for_any_account(block_number),
+			// 	TransactionType::UnsignedForAll =>
+			// 		Self::fetch_price_and_send_unsigned_for_all_accounts(block_number),
+			// 	TransactionType::Raw => Self::fetch_price_and_send_raw_unsigned(block_number),
+			// 	TransactionType::None => Ok(()),
+			// };
+			// if let Err(e) = res {
+			// 	log::error!("Error: {}", e);
+			// }
+		}
+	}
+
+
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
 		/// Passing as arguments the ID of the external match, and the odds,
@@ -247,9 +333,10 @@ pub mod pallet {
 			// If the match is not storage, add it.
 			if !<Matches<T>>::contains_key(id_match) {
 				let match_to_create = Match {
-					status: MatchStatus::Open,
+					status: MatchStatus::Locked,
 					home_score: 0, 
 					away_score: 0,
+					timestamp_start: 0,
 				};
 				// Store the match with id_match as key.
 				<Matches<T>>::insert(id_match, match_to_create);
@@ -261,6 +348,29 @@ pub mod pallet {
 			Self::deposit_event(Event::OddsCreated((id_match, odds_owner)));
 
 			Ok(())
+		}
+
+		/// Saves the match result into storage. At the moment the results are generated randomly,
+		/// in future developments it can be called by the oracle.
+		#[pallet::weight(10_000)]
+		pub fn set_match_start(
+			origin: OriginFor<T>,
+			id_match: MatchId,
+			timestamp_start: u32,
+		) -> DispatchResult {
+			let _who = ensure_signed(origin)?;
+			let mut selected_match = Self::matches(id_match).ok_or(Error::<T>::MatchNotExists)?;
+			// Check if match is locked.
+			ensure!(selected_match.status == MatchStatus::Locked, Error::<T>::MatchNotLocked);
+			// Update match status and results.
+			// todo: randomize also MatchStatus.
+			selected_match.status = MatchStatus::Open;
+			selected_match.timestamp_start = timestamp_start;
+			<Matches<T>>::insert(id_match, selected_match);
+			// todo: maybe can try also this way: <Matches<T>>::try_mutate, instead of insert.
+			
+			Self::deposit_event(Event::MatchOpened(id_match));
+			Ok(().into())
 		}
 
 		/// Allows a user to bet on an open match. To do this, the user need to select the ID of the match
@@ -327,6 +437,8 @@ pub mod pallet {
 		pub fn set_match_result(
 			origin: OriginFor<T>,
 			id_match: MatchId,
+			home_score: u32,
+			away_score: u32,
 		) -> DispatchResult {
 			let _who = ensure_signed(origin)?;
 			let mut selected_match = Self::matches(id_match).ok_or(Error::<T>::MatchNotExists)?;
@@ -335,8 +447,8 @@ pub mod pallet {
 			// Update match status and results.
 			// todo: randomize also MatchStatus.
 			selected_match.status = MatchStatus::Closed;
-			selected_match.home_score = Self::generate_random_score(0);
-			selected_match.away_score = Self::generate_random_score(1);
+			selected_match.home_score = home_score;
+			selected_match.away_score = away_score;
 			<Matches<T>>::insert(id_match, selected_match);
 			// todo: maybe can try also this way: <Matches<T>>::try_mutate, instead of insert.
 			
@@ -384,73 +496,118 @@ pub mod pallet {
 			Ok(().into())
 		}
 
-		// // /// Retrieves the match result and saves it in storage. Subsequently, based on the latter,
-		// // /// it scrolls all the bets related to that match and establishes the outcome, unreserving the entire amount of the bet
-		// // /// to the winner (bettor or bookmaker). N.B.:
-		// // ///     * This call that can be made by any user at the moment, should be scheduled after the end of the event,
-		// // /// 	saving the end-of-event timestamp among the match data.
-		// // ///     * The retrieval of a match result should be done through HTTP request using an ocw. To simplify this function,
-		// // /// 	the RandomnessCollectiveFlip implementation of Randomness was used to generate the scores of the teams.
-		// // #[pallet::weight(10_000)]
-		// // pub fn set_match_result_old(
-		// // 	origin: OriginFor<T>,
-		// // 	id_match: u32,
-		// // ) -> DispatchResult {
-		// // 	let _who = ensure_signed(origin)?;
-		// // 	let mut selected_match = Self::matches_by_id(id_match).ok_or(Error::<T>::MatchNotExists)?;
-		// // 	// Check if match is open.
-		// // 	ensure!(selected_match.status == MatchStatus::Open, Error::<T>::MatchClosed);
-		// // 	let match_owner = selected_match.owner.clone();
-		// // 	let selected_bets = <Bets<T>>::iter_prefix_values(id_match);
-		// // 	// Update match status and results.
-		// // 	// todo: randomize also MatchStatus.
-		// // 	selected_match.status = MatchStatus::Closed;
-		// // 	selected_match.home_score = Self::generate_random_score(0);
-		// // 	selected_match.away_score = Self::generate_random_score(1);
-		// // 	<Matches<T>>::insert(id_match, selected_match.clone());
-		// // 	// todo: maybe can try also this way: <Matches<T>>::try_mutate, instead of insert.
+		/// Saves the match result into storage. At the moment the results are generated randomly,
+		/// in future developments it can be called by the oracle.
+		#[pallet::weight(10_000)]
+		pub fn set_random_match_result(
+			origin: OriginFor<T>,
+			id_match: MatchId,
+		) -> DispatchResult {
+			let _who = ensure_signed(origin)?;
+			let mut selected_match = Self::matches(id_match).ok_or(Error::<T>::MatchNotExists)?;
+			// Check if match is open.
+			ensure!(selected_match.status == MatchStatus::Open, Error::<T>::MatchClosed);
+			// Update match status and results.
+			// todo: randomize also MatchStatus.
+			selected_match.status = MatchStatus::Closed;
+			selected_match.home_score = Self::generate_random_score(0);
+			selected_match.away_score = Self::generate_random_score(1);
+			<Matches<T>>::insert(id_match, selected_match);
+			// todo: maybe can try also this way: <Matches<T>>::try_mutate, instead of insert.
 			
-		// // 	// Check the winning status of the bet compared to match results.
-		// // 	let mut payoff_result = true;
-		// // 	selected_bets.for_each(|bet|{
-		// // 		let bet_status: BetStatus = match &bet.prediction {
-		// // 			Prediction::Homewin if selected_match.home_score > selected_match.away_score => BetStatus::Won,
-		// // 			Prediction::Awaywin if selected_match.home_score < selected_match.away_score => BetStatus::Won,
-		// // 			Prediction::Draw if selected_match.home_score == selected_match.away_score => BetStatus::Won,
-		// // 			Prediction::Over if selected_match.home_score + selected_match.away_score > 3 => BetStatus::Won,
-		// // 			Prediction::Under if selected_match.home_score + selected_match.away_score < 3 => BetStatus::Won,
-		// // 			_ => BetStatus::Lost,
-		// // 		};
-		// // 		let winnable_amount = (Percent::from_percent(bet.odd.1) * bet.amount).saturating_add(bet.amount.saturating_mul((bet.odd.0 as u32).into()));
-		// // 		// Pay off the bet.
-		// // 		if bet_status == BetStatus::Won {
-		// // 			let repatriate_result_mtob = T::Currency::repatriate_reserved(&match_owner, &(bet.owner), winnable_amount, BalanceStatus::Free).is_ok();
-		// // 			let repatriate_result_btom = T::Currency::repatriate_reserved(&(bet.owner), &match_owner, bet.amount, BalanceStatus::Free).is_ok();
-		// // 			if repatriate_result_mtob == false || repatriate_result_btom == false {
-		// // 				payoff_result = false;
-		// // 			}
-		// // 		} else {
-		// // 			let repatriate_result = T::Currency::repatriate_reserved(&(bet.owner), &match_owner, bet.amount.clone(), BalanceStatus::Free).is_ok();
-		// // 			let unreserve_result = T::Currency::unreserve(&match_owner, winnable_amount);
-		// // 			if repatriate_result == false || !unreserve_result.is_zero() {
-		// // 				payoff_result = false;
-		// // 			}
-		// // 		}
-				
-		// // 		// change bet status and save.
-		// // 		//bet.status = new_bet_status;
-		// // 		//let key : u8 = selected_bets.last_raw_key();
-		// // 		//<Bets<T>>::insert(id_match, selected_bets.last_raw_key(),bet);
-		// // 	});
-		// // 	ensure!(payoff_result == true, Error::<T>::PayoffError);
-		// // 	Self::deposit_event(Event::MatchClosed(id_match));
-		// // 	Ok(().into())
-		// // }
-
+			Self::deposit_event(Event::MatchClosed(id_match));
+			Ok(().into())
+		}
 	}
 }
 
 impl<T: Config> Pallet<T> {
+	/// A helper function to fetch the price and send signed transaction.
+	fn fetch_timestamp_and_send_signed(id_match : MatchId) -> Result<(), &'static str> {
+		let signer = Signer::<T, T::AuthorityId>::all_accounts();
+		if !signer.can_sign() {
+			return Err(
+				"No local accounts available. Consider adding one via `author_insertKey` RPC.",
+			)
+		}
+		// Make an external HTTP request to fetch the current price.
+		// Note this call will block until response is received.
+		let price = Self::fetch_timestamp().map_err(|_| "Failed to fetch price")?;
+
+		// Using `send_signed_transaction` associated type we create and submit a transaction
+		// representing the call, we've just created.
+		// Submit signed will return a vector of results for all accounts that were found in the
+		// local keystore with expected `KEY_TYPE`.
+		let results = signer.send_signed_transaction(|_account| {
+			// Received price is wrapped into a call to `submit_price` public function of this
+			// pallet. This means that the transaction, when executed, will simply call that
+			// function passing `price` as an argument.
+			Call::set_match_start { id_match, timestamp_start: price }
+		});
+
+		for (acc, res) in &results {
+			match res {
+				Ok(()) => log::info!("[{:?}] Submitted price of {} cents", acc.id, price),
+				Err(e) => log::error!("[{:?}] Failed to submit transaction: {:?}", acc.id, e),
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Fetch current price and return the result in cents.
+	fn fetch_timestamp() -> Result<u32, http::Error> {
+		let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
+		let url = "http://www.randomnumberapi.com/api/v1.0/random?min=".to_string().push_str("string");
+		let request =
+			http::Request::get("http://www.randomnumberapi.com/api/v1.0/random?min=1667249984&max=1767250084&count=1");
+			//http::Request::get("https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD");
+		let pending = request.deadline(deadline).send().map_err(|_| http::Error::IoError)?;
+		let response = pending.try_wait(deadline).map_err(|_| http::Error::DeadlineReached)??;
+		if response.code != 200 {
+			log::warn!("Unexpected status code: {}", response.code);
+			return Err(http::Error::Unknown)
+		}
+		let body = response.body().collect::<Vec<u8>>();
+		let body_str = sp_std::str::from_utf8(&body).map_err(|_| {
+			log::warn!("No UTF8 body");
+			http::Error::Unknown
+		})?;
+
+		let timestamp: u32 = body_str.replace("[", "").replace("]", "").parse().unwrap();
+		// let price = match Self::parse_price(body_str) {
+		// 	Some(price) => Ok(price),
+		// 	None => {
+		// 		log::warn!("Unable to extract price from the response: {:?}", body_str);
+		// 		Err(http::Error::Unknown)
+		// 	},
+		// }?;
+
+		log::warn!("Got timestamp: {}", timestamp);
+
+		Ok(timestamp)
+	}
+
+	/// Parse the price from the given JSON string using `lite-json`.
+	///
+	/// Returns `None` when parsing failed or `Some(price in cents)` when parsing is successful.
+	fn parse_price(price_str: &str) -> Option<u32> {
+		let val = lite_json::parse_json(price_str);
+		let price = match val.ok()? {
+			JsonValue::Object(obj) => {
+				let (_, v) = obj.into_iter().find(|(k, _)| k.iter().copied().eq("USD".chars()))?;
+				match v {
+					JsonValue::Number(number) => number,
+					_ => return None,
+				}
+			},
+			_ => return None,
+		};
+
+		let exp = price.fraction_length.saturating_sub(2);
+		Some(price.integer as u32 * 100 + (price.fraction / 10_u64.pow(exp)) as u32)
+	}
+
 	/// generate a random score for a match, some code from an internal function of lottery pallet.
 	fn generate_random_score(seed_diff: u32) -> u32 {
 		let mut random_number = Self::generate_random_number(seed_diff);
