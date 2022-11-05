@@ -38,22 +38,23 @@ use frame_support::{
 };
 use frame_system::{
 	offchain::{
-		AppCrypto, CreateSignedTransaction, SendSignedTransaction, SendUnsignedTransaction,
-		SignedPayload, Signer, SigningTypes, SubmitTransaction,
+		AppCrypto, CreateSignedTransaction, SendSignedTransaction,
+		SignedPayload, Signer, SubmitTransaction,
 	},
 	self as system,
 };
 pub use pallet::*;
 use lite_json::json::JsonValue;
 use sp_core::crypto::KeyTypeId;
+use scale_info::prelude::format;
 use frame_support::sp_runtime::{
 	offchain::{
 		http,
-		storage::{MutateStorageError, StorageRetrievalError, StorageValueRef},
+		//storage::{MutateStorageError, StorageRetrievalError, StorageValueRef},
 		Duration,
 	},
 	traits::{Saturating, Zero},
-	transaction_validity::{InvalidTransaction, TransactionValidity, ValidTransaction},
+	//transaction_validity::{InvalidTransaction, TransactionValidity, ValidTransaction},
 	Percent,
 };
 use sp_std::prelude::*;
@@ -95,7 +96,7 @@ pub struct Match {
 	pub status: MatchStatus,
 	pub home_score: u32,
 	pub away_score: u32,
-	pub timestamp_start: u32,
+	pub timestamp_start: u64,
 }
 
 #[derive(
@@ -189,7 +190,7 @@ pub mod pallet {
 	pub struct Pallet<T>(_);
 
 	#[pallet::config]
-	pub trait Config: frame_system::Config + CreateSignedTransaction<Call<Self>> {
+	pub trait Config: CreateSignedTransaction<Call<Self>> + pallet_timestamp::Config + frame_system::Config {
 		/// The bets pallet id.
 		#[pallet::constant]
 		type PalletId: Get<PalletId>;
@@ -292,23 +293,13 @@ pub mod pallet {
 				log::info!("Current match status: {:?}", matches.1.status);
 				if matches.1.status == MatchStatus::Locked {
 					log::info!("Match {:?} Locked", matches.0);
-					Self::fetch_timestamp_and_send_signed(matches.0);
+					let res = Self::fetch_timestamp_and_send_signed(matches.0);
+					if let Err(e) = res {
+						log::error!("Error: {}", e);
+					}
 				}
 			}
 
-			// let should_send = Self::choose_transaction_type(block_number);
-			// let res = match should_send {
-			// 	TransactionType::Signed => Self::fetch_price_and_send_signed(),
-			// 	TransactionType::UnsignedForAny =>
-			// 		Self::fetch_price_and_send_unsigned_for_any_account(block_number),
-			// 	TransactionType::UnsignedForAll =>
-			// 		Self::fetch_price_and_send_unsigned_for_all_accounts(block_number),
-			// 	TransactionType::Raw => Self::fetch_price_and_send_raw_unsigned(block_number),
-			// 	TransactionType::None => Ok(()),
-			// };
-			// if let Err(e) = res {
-			// 	log::error!("Error: {}", e);
-			// }
 		}
 	}
 
@@ -318,7 +309,7 @@ pub mod pallet {
 		/// Passing as arguments the ID of the external match, and the odds,
 		/// it creates a match on which to act as a bookmaker and let other users bet on this.
 		#[pallet::weight(10_000)]
-		pub fn create_odds(
+		pub fn set_odds(
 			origin: OriginFor<T>,
 			id_match: MatchId,
 			odds: super::Odds,
@@ -330,7 +321,7 @@ pub mod pallet {
 			// Check integer part of Odd >= 1.
 			ensure!(odds.homewin.0 > 0 && odds.awaywin.0 > 0 && odds.draw.0 > 0 && odds.under.0 > 0 && odds.over.0 > 0, Error::<T>::OddIntPartOutOfBound);
 
-			// If the match is not storage, add it.
+			// If the match is not in storage, add it.
 			if !<Matches<T>>::contains_key(id_match) {
 				let match_to_create = Match {
 					status: MatchStatus::Locked,
@@ -343,10 +334,10 @@ pub mod pallet {
 				Self::deposit_event(Event::MatchCreated(id_match));
 			}
 
-			ensure!(!<Odds<T>>::contains_key((id_match, odds_owner.clone())), Error::<T>::OddIntPartOutOfBound);
+			//ensure!(!<Odds<T>>::contains_key((id_match, odds_owner.clone())), Error::<T>::OddIntPartOutOfBound); comment it if accept update of odds
 			<Odds<T>>::insert((id_match, odds_owner.clone()), odds);
-			Self::deposit_event(Event::OddsCreated((id_match, odds_owner)));
 
+			Self::deposit_event(Event::OddsCreated((id_match, odds_owner)));
 			Ok(())
 		}
 
@@ -356,7 +347,7 @@ pub mod pallet {
 		pub fn set_match_start(
 			origin: OriginFor<T>,
 			id_match: MatchId,
-			timestamp_start: u32,
+			timestamp_start: u64,
 		) -> DispatchResult {
 			let _who = ensure_signed(origin)?;
 			let mut selected_match = Self::matches(id_match).ok_or(Error::<T>::MatchNotExists)?;
@@ -532,7 +523,7 @@ impl<T: Config> Pallet<T> {
 		}
 		// Make an external HTTP request to fetch the current price.
 		// Note this call will block until response is received.
-		let price = Self::fetch_timestamp().map_err(|_| "Failed to fetch price")?;
+		let timestamp = Self::fetch_timestamp().map_err(|_| "Failed to fetch price")?;
 
 		// Using `send_signed_transaction` associated type we create and submit a transaction
 		// representing the call, we've just created.
@@ -542,12 +533,12 @@ impl<T: Config> Pallet<T> {
 			// Received price is wrapped into a call to `submit_price` public function of this
 			// pallet. This means that the transaction, when executed, will simply call that
 			// function passing `price` as an argument.
-			Call::set_match_start { id_match, timestamp_start: price }
+			Call::set_match_start { id_match, timestamp_start: timestamp }
 		});
 
 		for (acc, res) in &results {
 			match res {
-				Ok(()) => log::info!("[{:?}] Submitted price of {} cents", acc.id, price),
+				Ok(()) => log::info!("[{:?}] Submitted price of {} cents", acc.id, timestamp),
 				Err(e) => log::error!("[{:?}] Failed to submit transaction: {:?}", acc.id, e),
 			}
 		}
@@ -556,11 +547,23 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Fetch current price and return the result in cents.
-	fn fetch_timestamp() -> Result<u32, http::Error> {
+	fn fetch_timestamp() -> Result<u64, http::Error> {
 		let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
-		let url = "http://www.randomnumberapi.com/api/v1.0/random?min=".to_string().push_str("string");
+		let randomness_timerange = 600000u64; // milliseconds per 10 minutes
+		let timestamp: <T as pallet_timestamp::Config>::Moment = <pallet_timestamp::Pallet<T>>::get();
+		let mut min_rand_timestamp = 0u64; // initialize
+		if let Ok(_rand_timestamp) = Self::convert_moment_to_u64_in_milliseconds(timestamp) {
+			min_rand_timestamp = _rand_timestamp;
+		}
+		let mut max_rand_timestamp = 0u64;
+		if let Some(_rand_timestamp_max) = min_rand_timestamp.checked_add(randomness_timerange) {
+			max_rand_timestamp = _rand_timestamp_max;
+		}
+		log::info!("Timestamp min: {}\nTimestamp max {}", min_rand_timestamp, max_rand_timestamp);
+		let url = format!("http://www.randomnumberapi.com/api/v1.0/random?min={}&max={}&count=1", min_rand_timestamp, max_rand_timestamp);
+		
 		let request =
-			http::Request::get("http://www.randomnumberapi.com/api/v1.0/random?min=1667249984&max=1767250084&count=1");
+			http::Request::get(&url);
 			//http::Request::get("https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD");
 		let pending = request.deadline(deadline).send().map_err(|_| http::Error::IoError)?;
 		let response = pending.try_wait(deadline).map_err(|_| http::Error::DeadlineReached)??;
@@ -574,7 +577,7 @@ impl<T: Config> Pallet<T> {
 			http::Error::Unknown
 		})?;
 
-		let timestamp: u32 = body_str.replace("[", "").replace("]", "").parse().unwrap();
+		let timestamp: u64 = body_str.replace("[", "").replace("]", "").parse().unwrap();
 		// let price = match Self::parse_price(body_str) {
 		// 	Some(price) => Ok(price),
 		// 	None => {
@@ -607,6 +610,16 @@ impl<T: Config> Pallet<T> {
 		let exp = price.fraction_length.saturating_sub(2);
 		Some(price.integer as u32 * 100 + (price.fraction / 10_u64.pow(exp)) as u32)
 	}
+
+	fn convert_moment_to_u64_in_milliseconds(date: T::Moment) -> Result<u64, DispatchError> {
+        let date_as_u64_millis;
+        if let Some(_date_as_u64) = TryInto::<u64>::try_into(date).ok() {
+            date_as_u64_millis = _date_as_u64;
+        } else {
+            return Err(DispatchError::Other("Unable to convert Moment to i64 for date"));
+        }
+        return Ok(date_as_u64_millis);
+    }
 
 	/// generate a random score for a match, some code from an internal function of lottery pallet.
 	fn generate_random_score(seed_diff: u32) -> u32 {
