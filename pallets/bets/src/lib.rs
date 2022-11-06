@@ -266,9 +266,11 @@ pub mod pallet {
 		/// Integer part of the Odd out of bound, must be 1 <= odd.0 <= 4_294_967_295u32.
 		OddIntPartOutOfBound,
 		/// Match not open for bets or updates, functions available only on open matches.
-		MatchClosed,
-		/// Match open during a bet claim.
+		MatchNotOpen,
+		/// Match open during bet settlement, cannot settle before match end.
 		MatchOpen,
+		/// Match already started, cannot set odds or place bets on it.
+		MatchStarted,
 		/// Insufficient free-balance to offer a bet.
 		OddsAccountInsufficientBalance,
 		/// Insufficient free-balance to place a bet.
@@ -289,13 +291,25 @@ pub mod pallet {
 			log::info!("Hello World from offchain workers!");
 			let parent_hash = <system::Pallet<T>>::block_hash(block_number - 1u32.into());
 			log::debug!("Current block: {:?} (parent hash: {:?})", block_number, parent_hash);
-			for matches in <Matches<T>>::iter() {
-				log::info!("Current match status: {:?}", matches.1.status);
-				if matches.1.status == MatchStatus::Locked {
-					log::info!("Match {:?} Locked", matches.0);
-					let res = Self::fetch_timestamp_and_send_signed(matches.0);
+			for itered_match in <Matches<T>>::iter() {
+				log::info!("Current match status: {:?}", itered_match.1.status);
+				if itered_match.1.status == MatchStatus::Locked {
+					log::info!("Match {:?} Locked: try to retrieve its timestamp_start", itered_match.0);
+					let res = Self::fetch_timestamp_and_send_signed(itered_match.0);
 					if let Err(e) = res {
 						log::error!("Error: {}", e);
+					}
+				} else if itered_match.1.status == MatchStatus::Open {
+					let mut now = 0u64; // initialize
+					if let Ok(_timestamp) = Self::convert_moment_to_u64_in_milliseconds(<pallet_timestamp::Pallet<T>>::get()) {
+						now = _timestamp;
+					}
+					if (itered_match.1.timestamp_start + 120000) < now {
+						log::info!("Match {:?} should be over: try to retrieve its result", itered_match.0);
+						let res = Self::fetch_match_result_and_send_signed(itered_match.0);
+						if let Err(e) = res {
+							log::error!("Error: {}", e);
+						}
 					}
 				}
 			}
@@ -332,6 +346,14 @@ pub mod pallet {
 				// Store the match with id_match as key.
 				<Matches<T>>::insert(id_match, match_to_create);
 				Self::deposit_event(Event::MatchCreated(id_match));
+			} else {
+				// Check match has not already started.
+				let match_to_book_on = Self::matches(id_match).ok_or(Error::<T>::MatchNotExists)?;
+				let mut timestamp_u64 = 0u64; // initialize
+				if let Ok(_timestamp) = Self::convert_moment_to_u64_in_milliseconds(<pallet_timestamp::Pallet<T>>::get()) {
+					timestamp_u64 = _timestamp;
+				}
+				ensure!(match_to_book_on.timestamp_start > timestamp_u64, Error::<T>::MatchStarted);
 			}
 
 			//ensure!(!<Odds<T>>::contains_key((id_match, odds_owner.clone())), Error::<T>::OddIntPartOutOfBound); comment it if accept update of odds
@@ -385,7 +407,14 @@ pub mod pallet {
 			// Ensure bet owner and match owner are not the same account.
 			ensure!(bet_owner != odds_owner.clone(), Error::<T>::SameMatchOwner);
 			// Ensure match is open.
-			ensure!(match_to_bet_on.status == MatchStatus::Open, Error::<T>::MatchClosed);
+			ensure!(match_to_bet_on.status == MatchStatus::Open, Error::<T>::MatchNotOpen);
+			// Ensure that the bet takes place before the match starts.
+			let timestamp: <T as pallet_timestamp::Config>::Moment = <pallet_timestamp::Pallet<T>>::get();
+			let mut timestamp_u64 = 0u64; // initialize
+			if let Ok(_timestamp) = Self::convert_moment_to_u64_in_milliseconds(timestamp) {
+				timestamp_u64 = _timestamp;
+			}
+			ensure!(match_to_bet_on.timestamp_start > timestamp_u64, Error::<T>::MatchStarted);
 			// Ensure that bettor account have suffient free balance.
 			ensure!(T::Currency::can_reserve(&bet_owner, amount), Error::<T>::BetAccountInsufficientBalance);
 
@@ -397,7 +426,7 @@ pub mod pallet {
 				Prediction::Under => odds.under,
 			};
 
-			let winnable_amount = (Percent::from_percent(odd.1) * amount).saturating_add(amount.saturating_mul((odd.0 as u32).into()));
+			let winnable_amount = (Percent::from_percent(odd.1) * amount).saturating_add(amount.saturating_mul(((odd.0 - 1) as u32).into()));
 			// Ensure that bookie account have suffient free balance.
 			ensure!(T::Currency::can_reserve(&odds_owner, winnable_amount), Error::<T>::OddsAccountInsufficientBalance);
 			T::Currency::reserve(&bet_owner, amount)?;
@@ -434,9 +463,8 @@ pub mod pallet {
 			let _who = ensure_signed(origin)?;
 			let mut selected_match = Self::matches(id_match).ok_or(Error::<T>::MatchNotExists)?;
 			// Check if match is open.
-			ensure!(selected_match.status == MatchStatus::Open, Error::<T>::MatchClosed);
+			ensure!(selected_match.status == MatchStatus::Open, Error::<T>::MatchNotOpen);
 			// Update match status and results.
-			// todo: randomize also MatchStatus.
 			selected_match.status = MatchStatus::Closed;
 			selected_match.home_score = home_score;
 			selected_match.away_score = away_score;
@@ -468,14 +496,14 @@ pub mod pallet {
 				Prediction::Under if selected_match.home_score + selected_match.away_score < 3 => BetStatus::Won,
 				_ => BetStatus::Lost,
 			};
-			let winnable_amount = (Percent::from_percent(bet.odd.1) * bet.amount).saturating_add(bet.amount.saturating_mul((bet.odd.0 as u32).into()));
+			let winnable_amount = (Percent::from_percent(bet.odd.1) * bet.amount).saturating_add(bet.amount.saturating_mul(((bet.odd.0 - 1) as u32).into()));
 			// Pay off the bet.
 			let odds_owner = &(bet.id_odds.1);
 			if bet_status == BetStatus::Won {
 				T::Currency::repatriate_reserved(odds_owner, &(bet.owner), winnable_amount, BalanceStatus::Free)?;
-				T::Currency::repatriate_reserved(&(bet.owner), odds_owner, bet.amount, BalanceStatus::Free)?;
+				T::Currency::unreserve(&(bet.owner), bet.amount);
 			} else {
-				T::Currency::repatriate_reserved(&(bet.owner), odds_owner, bet.amount.clone(), BalanceStatus::Free)?;
+				T::Currency::repatriate_reserved(&(bet.owner), odds_owner, bet.amount, BalanceStatus::Free)?;
 				T::Currency::unreserve(odds_owner, winnable_amount);
 			}
 			
@@ -497,7 +525,7 @@ pub mod pallet {
 			let _who = ensure_signed(origin)?;
 			let mut selected_match = Self::matches(id_match).ok_or(Error::<T>::MatchNotExists)?;
 			// Check if match is open.
-			ensure!(selected_match.status == MatchStatus::Open, Error::<T>::MatchClosed);
+			ensure!(selected_match.status == MatchStatus::Open, Error::<T>::MatchNotOpen);
 			// Update match status and results.
 			// todo: randomize also MatchStatus.
 			selected_match.status = MatchStatus::Closed;
@@ -538,7 +566,7 @@ impl<T: Config> Pallet<T> {
 
 		for (acc, res) in &results {
 			match res {
-				Ok(()) => log::info!("[{:?}] Submitted price of {} cents", acc.id, timestamp),
+				Ok(()) => log::info!("[{:?}] Submitted timestamp {}", acc.id, timestamp),
 				Err(e) => log::error!("[{:?}] Failed to submit transaction: {:?}", acc.id, e),
 			}
 		}
@@ -549,15 +577,19 @@ impl<T: Config> Pallet<T> {
 	/// Fetch current price and return the result in cents.
 	fn fetch_timestamp() -> Result<u64, http::Error> {
 		let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
-		let randomness_timerange = 600000u64; // milliseconds per 10 minutes
-		let timestamp: <T as pallet_timestamp::Config>::Moment = <pallet_timestamp::Pallet<T>>::get();
+		// Get random timestamp from http call: now+4mins < random_timestamp < now+6mins
+		let four_minutes_in_millis = 240000u64; // milliseconds per 4 minutes
+		let two_minutes_in_millis = 120000u64; // milliseconds per 2 minutes
 		let mut min_rand_timestamp = 0u64; // initialize
-		if let Ok(_rand_timestamp) = Self::convert_moment_to_u64_in_milliseconds(timestamp) {
-			min_rand_timestamp = _rand_timestamp;
+		if let Ok(_timestamp) = Self::convert_moment_to_u64_in_milliseconds(<pallet_timestamp::Pallet<T>>::get()) {
+			min_rand_timestamp = _timestamp;
+		}
+		if let Some(_timestamp_min) = min_rand_timestamp.checked_add(four_minutes_in_millis) {
+			min_rand_timestamp = _timestamp_min;
 		}
 		let mut max_rand_timestamp = 0u64;
-		if let Some(_rand_timestamp_max) = min_rand_timestamp.checked_add(randomness_timerange) {
-			max_rand_timestamp = _rand_timestamp_max;
+		if let Some(_timestamp_max) = min_rand_timestamp.checked_add(two_minutes_in_millis) {
+			max_rand_timestamp = _timestamp_max;
 		}
 		log::info!("Timestamp min: {}\nTimestamp max {}", min_rand_timestamp, max_rand_timestamp);
 		let url = format!("http://www.randomnumberapi.com/api/v1.0/random?min={}&max={}&count=1", min_rand_timestamp, max_rand_timestamp);
@@ -578,37 +610,65 @@ impl<T: Config> Pallet<T> {
 		})?;
 
 		let timestamp: u64 = body_str.replace("[", "").replace("]", "").parse().unwrap();
-		// let price = match Self::parse_price(body_str) {
-		// 	Some(price) => Ok(price),
-		// 	None => {
-		// 		log::warn!("Unable to extract price from the response: {:?}", body_str);
-		// 		Err(http::Error::Unknown)
-		// 	},
-		// }?;
 
 		log::warn!("Got timestamp: {}", timestamp);
 
 		Ok(timestamp)
 	}
 
-	/// Parse the price from the given JSON string using `lite-json`.
-	///
-	/// Returns `None` when parsing failed or `Some(price in cents)` when parsing is successful.
-	fn parse_price(price_str: &str) -> Option<u32> {
-		let val = lite_json::parse_json(price_str);
-		let price = match val.ok()? {
-			JsonValue::Object(obj) => {
-				let (_, v) = obj.into_iter().find(|(k, _)| k.iter().copied().eq("USD".chars()))?;
-				match v {
-					JsonValue::Number(number) => number,
-					_ => return None,
-				}
-			},
-			_ => return None,
-		};
+	/// A helper function to fetch the match result and send signed transaction.
+	fn fetch_match_result_and_send_signed(id_match : MatchId) -> Result<(), &'static str> {
+		let signer = Signer::<T, T::AuthorityId>::all_accounts();
+		if !signer.can_sign() {
+			return Err(
+				"No local accounts available. Consider adding one via `author_insertKey` RPC.",
+			)
+		}
+		let score = Self::fetch_match_result().map_err(|_| "Failed to fetch match result")?;
+		let results = signer.send_signed_transaction(|_account| {
+			Call::set_match_result { id_match: (id_match), home_score: (score.0), away_score: (score.1) }
+		});
 
-		let exp = price.fraction_length.saturating_sub(2);
-		Some(price.integer as u32 * 100 + (price.fraction / 10_u64.pow(exp)) as u32)
+		for (acc, res) in &results {
+			match res {
+				Ok(()) => log::info!("[{:?}] Submitted score {}-{}", acc.id, score.0, score.1),
+				Err(e) => log::error!("[{:?}] Failed to submit transaction: {:?}", acc.id, e),
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Fetch current price and return the result in cents.
+	fn fetch_match_result() -> Result<(u32,u32), http::Error> {
+		let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
+		const MIN_RAND_SCORE: u8 = 0;
+		const MAX_RAND_SCORE: u8 = 10;
+		let url = format!("http://www.randomnumberapi.com/api/v1.0/random?min={}&max={}&count=2", MIN_RAND_SCORE, MAX_RAND_SCORE);
+		
+		let request =
+			http::Request::get(&url);
+			//http::Request::get("https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD");
+		let pending = request.deadline(deadline).send().map_err(|_| http::Error::IoError)?;
+		let response = pending.try_wait(deadline).map_err(|_| http::Error::DeadlineReached)??;
+		if response.code != 200 {
+			log::warn!("Unexpected status code: {}", response.code);
+			return Err(http::Error::Unknown)
+		}
+		let body = response.body().collect::<Vec<u8>>();
+		let body_str = sp_std::str::from_utf8(&body).map_err(|_| {
+			log::warn!("No UTF8 body");
+			http::Error::Unknown
+		})?;
+
+		let body_parsed = body_str.replace("[", "").replace("]", "").replace(" ", "");
+		let mut split = body_parsed.split(",");
+		let homescore: u32 = split.nth(0).unwrap().parse().unwrap();
+		let awayscore: u32 = split.nth(1).unwrap().parse().unwrap();
+
+		log::warn!("Got score: {} - {}", homescore, awayscore);
+
+		Ok((homescore, awayscore))
 	}
 
 	fn convert_moment_to_u64_in_milliseconds(date: T::Moment) -> Result<u64, DispatchError> {

@@ -13,15 +13,15 @@ use sp_core::{
 	offchain::{self, testing, OffchainWorkerExt, TransactionPoolExt},
 	H256, crypto::KeyTypeId, OpaqueMetadata, sr25519::Signature,
 };
+use sp_keystore::{testing::KeyStore, KeystoreExt, SyncCryptoStore};
+use std::sync::Arc;
 use sp_runtime::{
 	create_runtime_str, generic, impl_opaque_keys,
 	testing::{Header,TestXt},
 	traits::{BlakeTwo256, IdentityLookup, IdentifyAccount, Verify, Extrinsic as ExtrinsicT},
-	Perbill, MultiSignature, SaturatedConversion,
+	Perbill, RuntimeAppPublic, MultiSignature, SaturatedConversion,
 };
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
-use codec::alloc::string::String;
-pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"btc!");
 //pub use pallet_timestamp::Call as TimestampCall;
 
 type UncheckedExtrinsic = frame_system::mocking::MockUncheckedExtrinsic<Test>;
@@ -32,16 +32,16 @@ type Block = frame_system::mocking::MockBlock<Test>;
 /// to the public key of our transaction signing scheme.
 pub type AccountId = <<Signature as Verify>::Signer as IdentifyAccount>::AccountId;
 /// The SignedExtension to the basic transaction logic.
-pub type SignedExtra = (
-	frame_system::CheckNonZeroSender<Test>,
-	frame_system::CheckSpecVersion<Test>,
-	frame_system::CheckTxVersion<Test>,
-	frame_system::CheckGenesis<Test>,
-	frame_system::CheckEra<Test>,
-	frame_system::CheckNonce<Test>,
-	frame_system::CheckWeight<Test>,
-	//pallet_transaction_payment::ChargeTransactionPayment<Test>,
-);
+// pub type SignedExtra = (
+// 	frame_system::CheckNonZeroSender<Test>,
+// 	frame_system::CheckSpecVersion<Test>,
+// 	frame_system::CheckTxVersion<Test>,
+// 	frame_system::CheckGenesis<Test>,
+// 	frame_system::CheckEra<Test>,
+// 	frame_system::CheckNonce<Test>,
+// 	frame_system::CheckWeight<Test>,
+// 	//pallet_transaction_payment::ChargeTransactionPayment<Test>,
+// );
 /// Index of a transaction in the chain.
 pub type Index = u32;
 /// An index to a block.
@@ -225,5 +225,63 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
 	}
 	.assimilate_storage(&mut t)
 	.unwrap();
+
 	t.into()
+}
+
+pub fn new_test_ext_ocw() -> sp_io::TestExternalities {
+	let mut t = frame_system::GenesisConfig::default().build_storage::<Test>().unwrap();
+	pallet_balances::GenesisConfig::<Test> {
+		balances: vec![(acc_pub(1), 100), (acc_pub(2), 100), (acc_pub(3), 100), (acc_pub(4), 100), (acc_pub(5), 100)],
+	}
+	.assimilate_storage(&mut t)
+	.unwrap();
+
+	//Offchain setup
+	const PHRASE: &str = "news slush supreme milk chapter athlete soap sausage put clutch what kitten";
+	let (offchain, offchain_state) = testing::TestOffchainExt::new();
+	let (pool, pool_state) = testing::TestTransactionPoolExt::new();
+	let keystore = KeyStore::new();
+	SyncCryptoStore::sr25519_generate_new(
+		&keystore,
+		crate::crypto::Public::ID,
+		Some(&format!("{}/hunter1", PHRASE)),
+	)
+	.unwrap();
+	let mut ext = sp_io::TestExternalities::new(t);
+	ext.register_extension(OffchainWorkerExt::new(offchain));
+	ext.register_extension(TransactionPoolExt::new(pool));
+	ext.register_extension(KeystoreExt(Arc::new(keystore)));
+	offchain_state.write().expect_request(testing::PendingRequest {
+		method: "GET".into(),
+		uri: "http://www.randomnumberapi.com/api/v1.0/random?min=0&max=600000&count=1".into(),
+		response: Some(br#"[1667758138]"#.to_vec()),
+		sent: true,
+		..Default::default()
+	});
+	ext.execute_with(|| {
+		//Timestamp::set_timestamp(Timestamp::now());
+		let id_match = (1,23);
+		let odds = Odds {
+			homewin: (2,00),
+			awaywin: (2,00),
+			draw: (2,00),
+			under: (2,00),
+			over: (2,00),
+		};
+		assert_eq!(Balances::total_issuance(), 500);
+		Bets::set_odds(Origin::signed(acc_pub(1)), id_match, odds).unwrap();
+		Bets::fetch_timestamp_and_send_signed(id_match).unwrap();
+		// let match_created = Bets::matches(id_match).unwrap();
+		// assert_eq!(match_created.timestamp_start, 1667758138);
+		let tx = pool_state.write().transactions.pop().unwrap();
+		assert!(pool_state.read().transactions.is_empty());
+		let tx = Extrinsic::decode(&mut &*tx).unwrap();
+		assert_eq!(tx.signature.unwrap().0, 0);
+		assert_eq!(tx.call, Call::Bets(crate::Call::set_match_start { id_match: (id_match), timestamp_start: (1667758138) }));
+		let match_created = Bets::matches(id_match).unwrap();
+		assert_eq!(match_created.timestamp_start, 1667758138);
+	});
+
+	ext
 }
