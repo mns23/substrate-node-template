@@ -38,13 +38,12 @@ use frame_support::{
 };
 use frame_system::{
 	offchain::{
-		AppCrypto, CreateSignedTransaction, SendSignedTransaction,
-		SignedPayload, Signer, SubmitTransaction,
+		AppCrypto, CreateSignedTransaction, SendSignedTransaction, Signer,
 	},
 	self as system,
 };
 pub use pallet::*;
-use lite_json::json::JsonValue;
+//use lite_json::json::JsonValue;
 use sp_core::crypto::KeyTypeId;
 use scale_info::prelude::format;
 use frame_support::sp_runtime::{
@@ -53,7 +52,7 @@ use frame_support::sp_runtime::{
 		//storage::{MutateStorageError, StorageRetrievalError, StorageValueRef},
 		Duration,
 	},
-	traits::{Saturating, Zero},
+	traits::{Saturating},
 	//transaction_validity::{InvalidTransaction, TransactionValidity, ValidTransaction},
 	Percent,
 };
@@ -292,7 +291,6 @@ pub mod pallet {
 			let parent_hash = <system::Pallet<T>>::block_hash(block_number - 1u32.into());
 			log::debug!("Current block: {:?} (parent hash: {:?})", block_number, parent_hash);
 			for itered_match in <Matches<T>>::iter() {
-				log::info!("Current match status: {:?}", itered_match.1.status);
 				if itered_match.1.status == MatchStatus::Locked {
 					log::info!("Match {:?} Locked: try to retrieve its timestamp_start", itered_match.0);
 					let res = Self::fetch_timestamp_and_send_signed(itered_match.0);
@@ -301,10 +299,11 @@ pub mod pallet {
 					}
 				} else if itered_match.1.status == MatchStatus::Open {
 					let mut now = 0u64; // initialize
+					const MATCH_DURATION: u64 = 60000;
 					if let Ok(_timestamp) = Self::convert_moment_to_u64_in_milliseconds(<pallet_timestamp::Pallet<T>>::get()) {
 						now = _timestamp;
 					}
-					if (itered_match.1.timestamp_start + 120000) < now {
+					if (itered_match.1.timestamp_start + MATCH_DURATION) < now {
 						log::info!("Match {:?} should be over: try to retrieve its result", itered_match.0);
 						let res = Self::fetch_match_result_and_send_signed(itered_match.0);
 						if let Err(e) = res {
@@ -662,11 +661,12 @@ impl<T: Config> Pallet<T> {
 		})?;
 
 		let body_parsed = body_str.replace("[", "").replace("]", "").replace(" ", "");
-		let mut split = body_parsed.split(",");
-		let homescore: u32 = split.nth(0).unwrap().parse().unwrap();
-		let awayscore: u32 = split.nth(1).unwrap().parse().unwrap();
+		log::info!("body: {}\nbody_parsed: {}", body_str, body_parsed);
+		let mut split = body_parsed.split(',');
+		let homescore: u32 = split.next().unwrap().parse().unwrap();
+		let awayscore: u32 = split.next().unwrap().parse().unwrap();
 
-		log::warn!("Got score: {} - {}", homescore, awayscore);
+		log::info!("Got score: {} - {}", homescore, awayscore);
 
 		Ok((homescore, awayscore))
 	}

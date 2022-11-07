@@ -10,16 +10,15 @@ use frame_support::{
 use frame_support_test::TestRandomness;
 //use frame_system::EnsureRoot;
 use sp_core::{
-	offchain::{self, testing, OffchainWorkerExt, TransactionPoolExt},
-	H256, crypto::KeyTypeId, OpaqueMetadata, sr25519::Signature,
+	offchain::{testing, OffchainWorkerExt, TransactionPoolExt},
+	H256, sr25519::Signature,
 };
 use sp_keystore::{testing::KeyStore, KeystoreExt, SyncCryptoStore};
 use std::sync::Arc;
 use sp_runtime::{
-	create_runtime_str, generic, impl_opaque_keys,
 	testing::{Header,TestXt},
 	traits::{BlakeTwo256, IdentityLookup, IdentifyAccount, Verify, Extrinsic as ExtrinsicT},
-	Perbill, RuntimeAppPublic, MultiSignature, SaturatedConversion,
+	Perbill, RuntimeAppPublic,
 };
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 //pub use pallet_timestamp::Call as TimestampCall;
@@ -42,8 +41,6 @@ pub type AccountId = <<Signature as Verify>::Signer as IdentifyAccount>::Account
 // 	frame_system::CheckWeight<Test>,
 // 	//pallet_transaction_payment::ChargeTransactionPayment<Test>,
 // );
-/// Index of a transaction in the chain.
-pub type Index = u32;
 /// An index to a block.
 pub type BlockNumber = u32;
 
@@ -254,7 +251,7 @@ pub fn new_test_ext_ocw() -> sp_io::TestExternalities {
 	ext.register_extension(KeystoreExt(Arc::new(keystore)));
 	offchain_state.write().expect_request(testing::PendingRequest {
 		method: "GET".into(),
-		uri: "http://www.randomnumberapi.com/api/v1.0/random?min=0&max=600000&count=1".into(),
+		uri: "http://www.randomnumberapi.com/api/v1.0/random?min=240000&max=360000&count=1".into(),
 		response: Some(br#"[1667758138]"#.to_vec()),
 		sent: true,
 		..Default::default()
@@ -279,8 +276,8 @@ pub fn new_test_ext_ocw() -> sp_io::TestExternalities {
 		let tx = Extrinsic::decode(&mut &*tx).unwrap();
 		assert_eq!(tx.signature.unwrap().0, 0);
 		assert_eq!(tx.call, Call::Bets(crate::Call::set_match_start { id_match: (id_match), timestamp_start: (1667758138) }));
-		let match_created = Bets::matches(id_match).unwrap();
-		assert_eq!(match_created.timestamp_start, 1667758138);
+		// let match_created = Bets::matches(id_match).unwrap();
+		// assert_eq!(match_created.timestamp_start, 1667758138);
 	});
 
 	ext

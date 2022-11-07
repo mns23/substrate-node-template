@@ -4112,7 +4112,6 @@ dependencies = [
  "frame-support",
  "frame-support-test",
  "frame-system",
- "lite-json",
  "log",
  "pallet-aura",
  "pallet-balances",
